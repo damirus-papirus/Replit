@@ -1,21 +1,144 @@
 import requests
 import json
+import os
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# ============ КЕШ (чтобы не качать данные каждый раз) ============
-cache = {
-    'data': None,
-    'city': None,
-    'model': None,
-    'last_update': None
-}
+# ============ HTML ИНТЕРФЕЙС ============
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌤️ Умный прогноз погоды</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e, #16213e, #0f3460);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { text-align: center; font-size: 2.5em; margin-bottom: 20px; background: linear-gradient(90deg, #f7971e, #ffd200); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .search-box { display: flex; gap: 10px; margin-bottom: 30px; }
+        .search-box input { flex: 1; padding: 15px 20px; border: none; border-radius: 30px; font-size: 16px; background: rgba(255,255,255,0.1); color: #fff; }
+        .search-box button { padding: 15px 30px; border: none; border-radius: 30px; background: linear-gradient(90deg, #f7971e, #ffd200); color: #1a1a2e; font-weight: bold; cursor: pointer; }
+        .card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; margin-bottom: 20px; border: 1px solid rgba(255,255,255,0.1); }
+        .current-weather { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; }
+        .current-weather .item { text-align: center; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 15px; }
+        .current-weather .item .value { font-size: 28px; font-weight: bold; margin-top: 5px; }
+        .forecast-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .forecast-table th { text-align: left; padding: 10px; border-bottom: 2px solid rgba(255,255,255,0.1); opacity: 0.7; font-size: 12px; }
+        .forecast-table td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+        .stats .stat-item { text-align: center; padding: 15px; background: rgba(255,255,255,0.03); border-radius: 15px; }
+        .stats .stat-item .number { font-size: 32px; font-weight: bold; color: #ffd200; }
+        .loading { text-align: center; padding: 50px; opacity: 0.7; }
+        .error { background: rgba(255,0,0,0.2); border-radius: 15px; padding: 20px; text-align: center; color: #ff6b6b; }
+        @media (max-width: 600px) { h1 { font-size: 1.8em; } .search-box { flex-direction: column; } .current-weather { grid-template-columns: repeat(2, 1fr); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌤️ Умный прогноз</h1>
+        <div class="search-box">
+            <input type="text" id="cityInput" placeholder="Введите город..." value="Bayazitovo">
+            <button onclick="getWeather()">🔍 Узнать</button>
+        </div>
+        <div id="result">
+            <div class="loading">Введите город и нажмите "Узнать"</div>
+        </div>
+    </div>
 
-# ============ ФУНКЦИИ ============
+    <script>
+        function getWeather() {
+            const city = document.getElementById('cityInput').value.trim();
+            if (!city) { alert('Введите название города'); return; }
+
+            document.getElementById('result').innerHTML = '<div class="loading">⏳ Загружаем данные...</div>';
+
+            fetch(`/api/forecast?city=${encodeURIComponent(city)}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('result').innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    renderWeather(data);
+                })
+                .catch(() => {
+                    document.getElementById('result').innerHTML = '<div class="error">❌ Ошибка подключения</div>';
+                });
+        }
+
+        function renderWeather(data) {
+            const current = data.current;
+            const stats = data.stats;
+            const forecast = data.forecast;
+
+            let html = `
+                <div class="card">
+                    <h2 style="margin-bottom:15px;">📍 ${data.city}</h2>
+                    <div class="current-weather">
+                        <div class="item"><div class="label">🌡️ Средняя</div><div class="value">${current.temp_mean}°C</div></div>
+                        <div class="item"><div class="label">🔥 Максимум</div><div class="value">${current.temp_max}°C</div></div>
+                        <div class="item"><div class="label">❄️ Минимум</div><div class="value">${current.temp_min}°C</div></div>
+                        <div class="item"><div class="label">🌧️ Осадки</div><div class="value">${current.precip} мм</div></div>
+                        <div class="item" style="grid-column: span 2;"><div class="label">📝 Погода</div><div class="value" style="font-size:20px;">${current.weather}</div></div>
+                    </div>
+                    <div style="margin-top:15px;font-size:14px;opacity:0.7;">📅 ${current.date}</div>
+                </div>
+
+                <div class="card">
+                    <h3>📊 Статистика за ${stats.years} лет</h3>
+                    <div class="stats">
+                        <div class="stat-item"><div class="number">${stats.max_all}°C</div><div style="opacity:0.7;font-size:14px;">Максимум</div></div>
+                        <div class="stat-item"><div class="number">${stats.min_all}°C</div><div style="opacity:0.7;font-size:14px;">Минимум</div></div>
+                        <div class="stat-item"><div class="number">${stats.days}</div><div style="opacity:0.7;font-size:14px;">Дней</div></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>📅 Прогноз на 30 дней</h3>
+                    <table class="forecast-table">
+                        <thead><tr><th>День</th><th>Дата</th><th>Средняя</th><th>Макс</th><th>Мин</th><th>Осадки</th><th>Погода</th></tr></thead>
+                        <tbody>
+            `;
+
+            forecast.forEach((f, index) => {
+                const labels = ['Завтра', 'Через 2д', 'Через 3д', 'Через 4д', 'Через 5д', 'Через 6д', 'Через 7д'];
+                const label = index < 7 ? labels[index] : `+${f.day}д`;
+                html += `
+                    <tr>
+                        <td><strong>${label}</strong></td>
+                        <td>${f.date}</td>
+                        <td>${f.temp_mean}°C</td>
+                        <td><span style="color:#ff6b6b;">${f.temp_max}°C</span></td>
+                        <td><span style="color:#74b9ff;">${f.temp_min}°C</span></td>
+                        <td>${f.precip} мм</td>
+                        <td>${f.weather}</td>
+                    </tr>
+                `;
+            });
+
+            html += `</tbody></table></div>`;
+            document.getElementById('result').innerHTML = html;
+        }
+
+        document.addEventListener('DOMContentLoaded', getWeather);
+    </script>
+</body>
+</html>
+"""
+
+# ============ ОСНОВНЫЕ ФУНКЦИИ ============
 
 def get_coordinates(city):
     url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=ru&format=json"
@@ -92,8 +215,9 @@ def get_weather_description(code):
     codes = {0: "☀️ Ясно", 1: "🌤️ Малооблачно", 2: "⛅ Переменная облачность", 3: "☁️ Пасмурно", 45: "🌫️ Туман", 61: "🌧️ Дождь", 63: "🌧️ Дождь", 65: "🌧️ Сильный дождь", 71: "❄️ Снег", 80: "🌧️ Ливень", 81: "🌧️ Ливень", 95: "⛈️ Гроза"}
     return codes.get(code, "❓ Неизвестно")
 
+cache = {'city': None, 'data': None, 'model': None}
+
 def get_forecast_data(city):
-    # Проверяем кеш
     if cache['city'] == city and cache['data']:
         historical = cache['data']
         model = cache['model']
@@ -107,12 +231,9 @@ def get_forecast_data(city):
             return {'error': 'Не удалось загрузить данные'}
         
         model = build_model(historical)
-        
-        # Сохраняем в кеш
         cache['city'] = city
         cache['data'] = historical
         cache['model'] = model
-        cache['last_update'] = datetime.now()
     
     last_date = historical[-1]['time']
     forecast = []
@@ -169,13 +290,11 @@ def get_forecast_data(city):
         'forecast': forecast
     }
 
+# ============ РОУТЫ ============
+
 @app.route('/')
 def index():
-    return '''
-    <h1>🌤️ Умный прогноз погоды</h1>
-    <p>Используйте API: <code>/api/forecast?city=Название</code></p>
-    <p>Пример: <a href="/api/forecast?city=Moscow">/api/forecast?city=Moscow</a></p>
-    '''
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/forecast')
 def api_forecast():
@@ -193,6 +312,7 @@ def api_forecast():
 def health():
     return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
 
+# ============ ЗАПУСК ============
+
 if __name__ == '__main__':
-    print("🚀 Сервер готов к продакшну!")
     app.run(host='0.0.0.0', port=5000)
