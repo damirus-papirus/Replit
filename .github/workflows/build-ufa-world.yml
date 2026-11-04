@@ -1,0 +1,93 @@
+name: Build UFA REAL CITY
+
+on:
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: "OSM bounding box: south,west,north,east"
+        required: true
+        default: "54.65,55.78,55.10,56.20"
+        type: string
+      scale:
+        description: "Metres per Minecraft block (1.0 = 1:1)"
+        required: true
+        default: "1.0"
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-ufa-world.yml"
+      - "ufa-world/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ufa-world-build
+  cancel-in-progress: false
+
+jobs:
+  build-world:
+    name: Generate Bedrock world
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      RUST_LOG: info
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Set build parameters
+        id: params
+        shell: bash
+        run: |
+          echo "bbox=${{ inputs.bbox || '54.65,55.78,55.10,56.20' }}" >> "$GITHUB_OUTPUT"
+          echo "scale=${{ inputs.scale || '1.0' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: osm-to-bedrock -> target
+
+      - name: Download OSM-to-Bedrock generator
+        run: git clone --depth 1 https://github.com/paulrobello/osm-to-bedrock.git osm-to-bedrock
+
+      - name: Build generator
+        run: cargo build --release --locked --manifest-path osm-to-bedrock/Cargo.toml
+
+      - name: Generate Ufa map at 1:1 scale
+        shell: bash
+        env:
+          BBOX: ${{ steps.params.outputs.bbox }}
+          SCALE: ${{ steps.params.outputs.scale }}
+        run: |
+          set -euo pipefail
+          WORLD_DIR="$RUNNER_TEMP/UFA-REAL-CITY"
+          mkdir -p "$RUNNER_TEMP"
+          osm-to-bedrock/target/release/osm-to-bedrock fetch-convert \
+            --bbox "$BBOX" \
+            --output "$WORLD_DIR" \
+            --world-name "UFA REAL CITY" \
+            --scale "$SCALE" \
+            --building-height 8 \
+            --spawn-lat 54.735 \
+            --spawn-lon 55.958 \
+            --signs \
+            --poi-markers
+
+          test -s "$WORLD_DIR/level.dat"
+          test -d "$WORLD_DIR/db"
+          cd "$WORLD_DIR"
+          zip -q -r "$RUNNER_TEMP/UFA-REAL-CITY.mcworld" .
+
+      - name: Upload Minecraft world
+        uses: actions/upload-artifact@v4
+        with:
+          name: UFA-REAL-CITY-Bedrock-1.20.80
+          path: ${{ runner.temp }}/UFA-REAL-CITY.mcworld
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
