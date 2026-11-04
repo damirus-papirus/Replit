@@ -1,0 +1,26 @@
+{
+  "project": "UFA REAL CITY",
+  "edition": "Minecraft Bedrock",
+  "target_version": "1.20.80",
+  "scale_metres_per_block": 1,
+  "bbox": [
+    54.65,
+    55.78,
+    55.1,
+    56.2
+  ],
+  "spawn": {
+    "latitude": 54.735,
+    "longitude": 55.958
+  },
+  "features": [
+    "buildings",
+    "roads",
+    "waterways",
+    "green_areas",
+    "railways",
+    "street_signs",
+    "poi_markers"
+  ],
+  "attribution": "© OpenStreetMap contributors — https://www.openstreetmap.org/copyright"
+}
