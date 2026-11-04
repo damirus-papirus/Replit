@@ -1,0 +1,272 @@
+name: Build UFA REAL CITY
+
+on:
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: "OSM bounding box: south,west,north,east"
+        required: true
+        default: "54.65,55.78,55.10,56.20"
+        type: string
+      scale:
+        description: "Metres per Minecraft block (1.0 = 1:1)"
+        required: true
+        default: "1.0"
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-ufa-world.yml"
+      - "ufa-world/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ufa-world-build
+  cancel-in-progress: false
+
+jobs:
+  build-world:
+    name: Generate UFA REAL CITY
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      RUST_LOG: info
+      TILE_STEP: "0.08"
+      TILE_OVERLAP: "0.003"
+      ORIGIN_LAT: "54.875"
+      ORIGIN_LON: "55.990"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set parameters
+        id: params
+        shell: bash
+        env:
+          INPUT_BBOX: ${{ inputs.bbox || '54.65,55.78,55.10,56.20' }}
+          INPUT_SCALE: ${{ inputs.scale || '1.0' }}
+        run: |
+          set -euo pipefail
+          echo "bbox=$INPUT_BBOX" >> "$GITHUB_OUTPUT"
+          echo "scale=$INPUT_SCALE" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: osm-to-bedrock -> target
+
+      - name: Download generator
+        run: git clone --depth 1 https://github.com/paulrobello/osm-to-bedrock.git osm-to-bedrock
+
+      - name: Patch generator for a shared city origin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("osm-to-bedrock/src/pipeline/mod.rs")
+          source = path.read_text()
+
+          old = """    let (origin_lat, origin_lon) = {
+          let (min_lat, min_lon, max_lat, max_lon) = data
+              .bounds()
+              .ok_or_else(|| anyhow::anyhow!("OSM file has no nodes"))?;
+          ((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0)
+      };"""
+
+          new = """    let env_origin = match (
+          std::env::var("OSM_TO_BEDROCK_ORIGIN_LAT"),
+          std::env::var("OSM_TO_BEDROCK_ORIGIN_LON"),
+      ) {
+          (Ok(lat), Ok(lon)) => {
+              match (lat.parse::<f64>(), lon.parse::<f64>()) {
+                  (Ok(lat), Ok(lon)) if lat.is_finite() && lon.is_finite() =>
+                      Some((lat, lon)),
+                  _ => None,
+              }
+          }
+          _ => None,
+      };
+
+      let (origin_lat, origin_lon) = if let Some(origin) = env_origin {
+          origin
+      } else {
+          let (min_lat, min_lon, max_lat, max_lon) = data
+              .bounds()
+              .ok_or_else(|| anyhow::anyhow!("OSM file has no nodes"))?;
+          ((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0)
+      };"""
+
+          if old not in source:
+              raise SystemExit("Could not find the expected origin code. Generator source changed.")
+
+          path.write_text(source.replace(old, new, 1))
+          print("Shared-origin patch applied.")
+          PY
+
+      - name: Build generator
+        run: cargo build --release --locked --manifest-path osm-to-bedrock/Cargo.toml
+
+      - name: Calculate tiles and shared spawn
+        id: tiles
+        shell: bash
+        env:
+          BBOX: ${{ steps.params.outputs.bbox }}
+          SCALE: ${{ steps.params.outputs.scale }}
+          ORIGIN_LAT: ${{ env.ORIGIN_LAT }}
+          ORIGIN_LON: ${{ env.ORIGIN_LON }}
+          TILE_STEP: ${{ env.TILE_STEP }}
+          TILE_OVERLAP: ${{ env.TILE_OVERLAP }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import math
+
+          south, west, north, east = map(float, os.environ["BBOX"].split(","))
+          scale = float(os.environ["SCALE"])
+          origin_lat = float(os.environ["ORIGIN_LAT"])
+          origin_lon = float(os.environ["ORIGIN_LON"])
+          step = float(os.environ["TILE_STEP"])
+          overlap = float(os.environ["TILE_OVERLAP"])
+
+          if not (-90 <= south < north <= 90):
+              raise SystemExit("Invalid latitude bounds")
+          if not (-180 <= west < east <= 180):
+              raise SystemExit("Invalid longitude bounds")
+          if scale <= 0 or step <= 0 or overlap < 0:
+              raise SystemExit("Invalid scale or tile settings")
+
+          spawn_lat = 54.735
+          spawn_lon = 55.958
+
+          spawn_x = round(
+              (spawn_lon - origin_lon)
+              * 111320
+              * math.cos(math.radians(origin_lat))
+              / scale
+          )
+          spawn_z = round(
+              -(spawn_lat - origin_lat) * 111320 / scale
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"spawn_x={spawn_x}\n")
+              out.write(f"spawn_z={spawn_z}\n")
+
+          tiles = []
+          lat = south
+          while lat < north - 1e-10:
+              lat2 = min(lat + step, north)
+              lon = west
+              while lon < east - 1e-10:
+                  lon2 = min(lon + step, east)
+
+                  s = max(south, lat - overlap)
+                  w = max(west, lon - overlap)
+                  n = min(north, lat2 + overlap)
+                  e = min(east, lon2 + overlap)
+
+                  tiles.append((s, w, n, e))
+                  lon = lon2
+              lat = lat2
+
+          with open("ufa-tiles.txt", "w") as f:
+              for tile in tiles:
+                  f.write(",".join(f"{v:.6f}" for v in tile) + "\n")
+
+          print(f"Tiles: {len(tiles)}")
+          print(f"Shared origin: {origin_lat}, {origin_lon}")
+          print(f"Spawn: {spawn_x}, 65, {spawn_z}")
+          PY
+
+      - name: Generate all city tiles into one world
+        shell: bash
+        env:
+          SCALE: ${{ steps.params.outputs.scale }}
+          ORIGIN_LAT: ${{ env.ORIGIN_LAT }}
+          ORIGIN_LON: ${{ env.ORIGIN_LON }}
+          SPAWN_X: ${{ steps.tiles.outputs.spawn_x }}
+          SPAWN_Z: ${{ steps.tiles.outputs.spawn_z }}
+        run: |
+          set -euo pipefail
+
+          WORLD_ROOT="$RUNNER_TEMP/world-output"
+          WORLD_DIR="$WORLD_ROOT/UFA REAL CITY"
+          mkdir -p "$WORLD_ROOT"
+
+          TOTAL=$(wc -l < ufa-tiles.txt)
+          CURRENT=0
+
+          while IFS= read -r TILE; do
+            CURRENT=$((CURRENT + 1))
+            echo "=========================================="
+            echo "Building tile $CURRENT / $TOTAL"
+            echo "BBox: $TILE"
+            echo "=========================================="
+
+            SUCCESS=0
+            ATTEMPT=1
+
+            while [ "$ATTEMPT" -le 4 ]; do
+              echo "Attempt $ATTEMPT / 4"
+
+              if OSM_TO_BEDROCK_ORIGIN_LAT="$ORIGIN_LAT" \
+                 OSM_TO_BEDROCK_ORIGIN_LON="$ORIGIN_LON" \
+                 osm-to-bedrock/target/release/osm-to-bedrock fetch-convert \
+                  --bbox "$TILE" \
+                  --output "$WORLD_ROOT" \
+                  --world-name "UFA REAL CITY" \
+                  --scale "$SCALE" \
+                  --building-height 8 \
+                  --spawn-x "$SPAWN_X" \
+                  --spawn-y 65 \
+                  --spawn-z "$SPAWN_Z" \
+                  --signs \
+                  --poi-markers
+              then
+                SUCCESS=1
+                break
+              fi
+
+              echo "Tile failed. Waiting before retry..."
+              sleep $((ATTEMPT * 20))
+              ATTEMPT=$((ATTEMPT + 1))
+            done
+
+            if [ "$SUCCESS" -ne 1 ]; then
+              echo "ERROR: tile $CURRENT failed after 4 attempts."
+              exit 1
+            fi
+
+            echo "Tile $CURRENT completed."
+            sleep 8
+          done < ufa-tiles.txt
+
+          test -s "$WORLD_DIR/level.dat"
+          test -d "$WORLD_DIR/db"
+
+          echo "All tiles completed."
+          echo "World size:"
+          du -sh "$WORLD_DIR"
+
+          cd "$WORLD_DIR"
+          zip -q -r "$RUNNER_TEMP/UFA-REAL-CITY.mcworld" .
+
+      - name: Upload Minecraft world
+        uses: actions/upload-artifact@v4
+        with:
+          name: UFA-REAL-CITY-Bedrock-1.20.80
+          path: ${{ runner.temp }}/UFA-REAL-CITY.mcworld
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
