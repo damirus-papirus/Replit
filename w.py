@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -73,7 +74,7 @@ HTML_TEMPLATE = """
 <div class="container">
     <h1>🌤️ Умный прогноз</h1>
     <div class="search-box">
-        <input type="text" id="cityInput" placeholder="Введите город..." value="Bayazitovo">
+        <input type="text" id="cityInput" placeholder="Город или координаты: 54.728545, 56.001729" value="54.728545, 56.001729">
         <button id="searchButton" type="button">🔍 Узнать</button>
     </div>
     <div id="result"><div class="loading">Загружаем данные...</div></div>
@@ -183,9 +184,32 @@ def safe_get_json(url, params=None):
 
 
 def get_coordinates(city):
+    """
+    Принимает как название города, так и координаты:
+    54.728545, 56.001729
+    54.728545 56.001729
+    54.728545; 56.001729
+    """
+    text = str(city).strip()
+    numbers = re.fullmatch(
+        r"\s*([+-]?\d+(?:[.,]\d+)?)\s*[,;\s]\s*([+-]?\d+(?:[.,]\d+)?)\s*",
+        text
+    )
+
+    if numbers:
+        lat = float(numbers.group(1).replace(",", "."))
+        lon = float(numbers.group(2).replace(",", "."))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return {
+                "lat": lat,
+                "lon": lon,
+                "name": f"Координаты {lat:.5f}, {lon:.5f}"
+            }
+        return None
+
     data = safe_get_json(
         "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": city, "count": 1, "language": "ru", "format": "json"}
+        params={"name": text, "count": 1, "language": "ru", "format": "json"}
     )
     results = data.get("results") or []
     if not results:
