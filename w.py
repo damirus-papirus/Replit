@@ -135,8 +135,8 @@ HTML_TEMPLATE = """
             '</div></div>';
 
         html += '<div class="card"><h3>📅 Климатическая оценка на 30 дней</h3>' +
-            '<div class="note">Это оценка по средним историческим значениям за соответствующие даты, а не точный метеорологический прогноз.</div>' +
-            '<div class="table-wrap"><table class="forecast-table"><thead><tr><th>День</th><th>Дата</th><th>Средняя</th><th>Макс</th><th>Мин</th><th>Осадки</th><th>Оценка</th></tr></thead><tbody>';
+            '<div class="note">Первые 7 дней рассчитываются методом исторических аналогов: сравниваются последние 5 дней с похожими периодами прошлого. Дни 8–30 показывают климатическую норму. Готовые прогнозы сторонних метеосервисов не используются.</div>' +
+            '<div class="table-wrap"><table class="forecast-table"><thead><tr><th>День</th><th>Дата</th><th>Средняя</th><th>Макс</th><th>Мин</th><th>Осадки</th><th>Оценка</th><th>Метод</th></tr></thead><tbody>';
 
         forecast.forEach(function (item) {
             const label = item.day === 1 ? 'Завтра' : 'Через ' + item.day + ' дн.';
@@ -146,7 +146,8 @@ HTML_TEMPLATE = """
                 '<td>' + escapeHtml(item.temp_max) + '°C</td>' +
                 '<td>' + escapeHtml(item.temp_min) + '°C</td>' +
                 '<td>' + escapeHtml(item.precip) + ' мм</td>' +
-                '<td>' + escapeHtml(item.weather) + '</td></tr>';
+                '<td>' + escapeHtml(item.weather) + '</td>' +
+                '<td>' + escapeHtml(item.method || 'Климатическая норма') + '</td></tr>';
         });
 
         html += '</tbody></table></div></div>';
@@ -328,6 +329,85 @@ def describe_climate(temp_max, precip):
     return description
 
 
+
+def _season_distance(date_a, date_b):
+    """Круговое расстояние между днями года, учитывающее переход через Новый год."""
+    a = date_a.timetuple().tm_yday
+    b = date_b.timetuple().tm_yday
+    return min(abs(a - b), 366 - abs(a - b))
+
+
+def build_analog_forecast(historical_data, horizon=7, analog_count=25, window=5):
+    """
+    Прогноз по историческим аналогам, без использования готовых прогнозов.
+    Сравнивает последние 5 дней с похожими историческими периодами и
+    усредняет погоду, которая следовала за ними.
+    """
+    if len(historical_data) < window + horizon + 30:
+        return []
+
+    recent = historical_data[-window:]
+    recent_center = recent[-1]["time"]
+    scales = {
+        "temp_mean": 8.0,
+        "temp_max": 8.0,
+        "temp_min": 8.0,
+        "precipitation": 5.0
+    }
+
+    candidates = []
+    # Оставляем минимум horizon дней после аналога, чтобы знать его продолжение.
+    for end_index in range(window, len(historical_data) - horizon):
+        analog_end = historical_data[end_index - 1]
+        if _season_distance(analog_end["time"], recent_center) > 45:
+            continue
+
+        distance = 0.0
+        for offset in range(window):
+            observed = recent[offset]
+            candidate = historical_data[end_index - window + offset]
+            for field, scale in scales.items():
+                delta = (observed[field] - candidate[field]) / scale
+                distance += delta * delta
+
+        distance /= window * len(scales)
+        # Сезонная близость учитывается как дополнительный штраф.
+        season_penalty = _season_distance(analog_end["time"], recent_center) / 45.0
+        distance += 0.12 * season_penalty * season_penalty
+        candidates.append((distance, end_index))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: item[0])
+    selected = candidates[:analog_count]
+    forecasts = []
+
+    for day_offset in range(1, horizon + 1):
+        weighted = {"temp_mean": 0.0, "temp_max": 0.0,
+                    "temp_min": 0.0, "precipitation": 0.0}
+        total_weight = 0.0
+
+        for distance, end_index in selected:
+            sample = historical_data[end_index + day_offset - 1]
+            weight = 1.0 / (0.05 + distance)
+            total_weight += weight
+            for field in weighted:
+                weighted[field] += sample[field] * weight
+
+        values = {field: value / total_weight for field, value in weighted.items()}
+        forecasts.append({
+            "temp_mean": values["temp_mean"],
+            "temp_max": values["temp_max"],
+            "temp_min": values["temp_min"],
+            "precip": values["precipitation"],
+            "analogs": len(selected),
+            "method": "historical_analogs"
+        })
+
+    return forecasts
+
+
 def get_forecast_data(city):
     location = get_coordinates(city)
     if not location:
@@ -355,10 +435,22 @@ def get_forecast_data(city):
     latest = historical[-1]
     today = datetime.now().date()
     forecast = []
+    analog_forecast = build_analog_forecast(historical, horizon=7)
 
     for day_number in range(1, 31):
         future_date = today + timedelta(days=day_number)
-        temp_mean, temp_max, temp_min, precip = predict_from_model(model, future_date)
+        if day_number <= len(analog_forecast):
+            values = analog_forecast[day_number - 1]
+            temp_mean = values["temp_mean"]
+            temp_max = values["temp_max"]
+            temp_min = values["temp_min"]
+            precip = values["precip"]
+            method = "Исторические аналоги"
+            analogs = values["analogs"]
+        else:
+            temp_mean, temp_max, temp_min, precip = predict_from_model(model, future_date)
+            method = "Климатическая норма"
+            analogs = 0
 
         forecast.append({
             "day": day_number,
@@ -367,7 +459,9 @@ def get_forecast_data(city):
             "temp_max": round(temp_max, 1),
             "temp_min": round(temp_min, 1),
             "precip": round(precip, 1),
-            "weather": describe_climate(temp_max, precip)
+            "weather": describe_climate(temp_max, precip),
+            "method": method,
+            "analogs": analogs
         })
 
     all_max = [item["temp_max"] for item in historical]
