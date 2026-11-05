@@ -74,7 +74,7 @@ HTML_TEMPLATE = """
 <div class="container">
     <h1>🌤️ Умный прогноз</h1>
     <div class="search-box">
-        <input type="text" id="cityInput" placeholder="Город или координаты: 54.728545, 56.001729" value="54.728545, 56.001729">
+        <input type="text" id="cityInput" placeholder="Введите город или координаты..." value="Москва">
         <button id="searchButton" type="button">🔍 Узнать</button>
     </div>
     <div id="result"><div class="loading">Загружаем данные...</div></div>
